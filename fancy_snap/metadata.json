@@ -1,0 +1,13 @@
+{
+  "KPackageStructure": "KWin/Script",
+  "KPlugin": {
+    "Id": "fancy_snap",
+    "Name": "Fancy Snap",
+    "Description": "FancyZones-style fixed-zone snapping for KWin custom tiles. Prevents zone drift on edge-resize; supports iterative border drag via sticky pairing.",
+    "License": "MIT",
+    "Version": "1.0",
+    "EnabledByDefault": true
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js"
+}
