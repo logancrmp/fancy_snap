@@ -1,8 +1,14 @@
 // fancy_snap — FancyZones-style fixed-zone snapping for KWin custom tiles.
 //
 // At a glance:
-//   * On load (and on virtual-desktop switch), snapshots every leaf tile's
-//     geometry into a frozen-layout cache keyed by Tile JS-object identity.
+//   * The snap zones are defined by the ZONES constant below (canonical column
+//     fractions, e.g. 0.25 / 0.5 / 0.25), NOT by whatever ratios KWin happens
+//     to have drifted to. Zone rects are never cached — they are recomputed on
+//     demand from ZONES against the root tile's LIVE geometry, which is the
+//     current work area. So a panel move, resolution change or output swap is
+//     picked up automatically instead of pinning windows to a stale rect.
+//   * KWin's own tile ratios are reset to ZONES whenever they drift, so the
+//     drift never reaches ~/.config/kwinrc either.
 //   * At resize-start of a tiled window, pre-emptively detiles it and pins
 //     its frame to the in-tile rect — KWin would otherwise pop the window
 //     back to its pre-snap remembered free-floating geometry mid-drag.
@@ -12,17 +18,43 @@
 //   * After a coupled untile, the two windows are recorded as a sticky pair
 //     so iterative re-drags of their shared edge keep working without ever
 //     re-tiling. Pair drops on re-tile, move-out-of-flush, or close.
-//   * On any tile-change with a non-null tile, asserts the frozen rect's
-//     split-axis dimensions while leaving KWin's panel-aware perpendicular
-//     axis alone.
-//   * Meta+Shift+T clears the freeze cache and re-snapshots the current live
-//     layout (run after editing zones via Meta+T).
+//   * On any tile-change into a canonical zone, asserts that zone's x/width
+//     while leaving KWin's panel-aware y/height alone.
+//   * Meta+Shift+T forces a re-assert (rarely needed; the signal hooks below
+//     should catch everything on their own).
 //
 // Tail logs with:
 //   journalctl --user -f _COMM=kwin_wayland | grep fancy_snap
 
 const TAG = "[fancy_snap]";
 const DEBUG = false;  // when true, also emit win.geom / win.mrChanged / stackProbe / per-leaf-tile dumps
+
+// --- Zone config ------------------------------------------------------------
+// THE one place to edit your layout. Column fractions, left -> right; should
+// sum to ~1.0. These are authoritative: zone rects are always derived from
+// them against the live work area, and any KWin tile layout whose top level is
+// a horizontal split into exactly this many columns is reset to these
+// fractions whenever it drifts. To change zones, edit this line and run
+// ./install.sh.
+const ZONES = [0.25, 0.5, 0.25];
+
+// Padding KWin leaves around each zone, in px. 0 = windows sit edge to edge and
+// run from the top of the work area to the panel, with no gap between columns.
+//
+// This is enforced too, because KWin stores padding per (virtual desktop,
+// output) — setting it in the Meta+T editor only fixes the desktop you happen
+// to be on, which is why gaps come back when you switch desktops or plug in a
+// display. Note KWin applies the full value against a screen edge but only half
+// of it against a shared edge between two columns, so a padding of 4 shows up
+// as a 4px gap at the screen border and a 4px gap between windows.
+const GAP = 0;
+
+// Sum of fractions before column i (cumulative left edge as a fraction).
+function zoneOffset(i) {
+    let acc = 0;
+    for (let j = 0; j < i; j++) acc += ZONES[j];
+    return acc;
+}
 
 function log() {
     const parts = [TAG];
@@ -46,6 +78,11 @@ function safeId(obj) {
     if (!obj) return "null";
     try { return obj.internalId || obj.windowId || obj.resourceClass || "?"; }
     catch (e) { return "?"; }
+}
+
+function rectApproxEqual(a, b) {
+    return Math.abs(a.x - b.x) <= 1 && Math.abs(a.y - b.y) <= 1
+        && Math.abs(a.width - b.width) <= 1 && Math.abs(a.height - b.height) <= 1;
 }
 
 // --- Stacking-order helpers ------------------------------------------------
@@ -80,7 +117,7 @@ function dumpTileStack(tile, label) {
 // --- Mirror rect ------------------------------------------------------------
 // Given the sibling's frozen rect and the grabbed window's new rect, compute
 // the sibling's new rect so its shared edge follows the grabbed window's
-// matching edge while its three other edges stay at the frozen-zone values.
+// matching edge while its three other edges stay put.
 function mirrorRect(siblingFrozen, edge, grabbedNew) {
     const gR = grabbedNew.x + grabbedNew.width;
     const gB = grabbedNew.y + grabbedNew.height;
@@ -99,42 +136,260 @@ function mirrorRect(siblingFrozen, edge, grabbedNew) {
     return null;
 }
 
-// --- Frozen layout cache ---------------------------------------------------
-// Map<Tile, {x, y, width, height}>. Tile JS object identity is stable across
-// reads, so the Tile itself is the cache key. Populated additively at script
-// load and on virtual-desktop switch; never overwrites an existing entry, so
-// the original frozen rect survives any drift in KWin's live tile geometry.
-const frozenLayout = new Map();
+// --- Canonical zone geometry ------------------------------------------------
+// Nothing here is cached. Every zone rect is a pure function of ZONES and the
+// root tile's live absoluteGeometry (== the current work area, already minus
+// panel struts), so a panel move or resolution change needs no invalidation.
 
-function rectClone(r) {
-    return { x: r.x, y: r.y, width: r.width, height: r.height };
-}
+// True when the root is a horizontal split into exactly ZONES.length leaves —
+// i.e. the layout we own and re-center. Anything else is left alone entirely.
+function isCanonicalRoot(root) {
+    if (!root) return false;
+    const kids = root.tiles || [];
+    if (root.layoutDirection !== 1 || kids.length !== ZONES.length) return false;
 
-function rectApproxEqual(a, b) {
-    return Math.abs(a.x - b.x) <= 1 && Math.abs(a.y - b.y) <= 1
-        && Math.abs(a.width - b.width) <= 1 && Math.abs(a.height - b.height) <= 1;
-}
-
-function freezeTree(t) {
-    if (!t) return;
-    const kids = t.tiles || [];
-    if (kids.length === 0) {
-        if (!frozenLayout.has(t)) frozenLayout.set(t, rectClone(t.absoluteGeometry));
-        return;
+    for (let i = 0; i < kids.length; i++) {
+        if (kids[i].tiles && kids[i].tiles.length > 0) return false;
     }
-    for (let i = 0; i < kids.length; i++) freezeTree(kids[i]);
+
+    return true;
 }
 
-function freezeCurrentVD(reason) {
+// Absolute rect of column i, matching how KWin itself insets a window inside a
+// tile: full `pad` against a screen edge, `pad/2` against a shared edge with
+// the neighbouring column (measured on KWin 6.7 — a 4px padding yields a 4px
+// outer inset and a 2px inner one). Getting this right matters because the
+// assert below compares against it; a wrong convention means fighting KWin by
+// pad/2 on every single snap.
+function canonicalRect(area, i, pad) {
+    const x0 = Math.round(area.x + zoneOffset(i) * area.width);
+    const x1 = Math.round(area.x + zoneOffset(i + 1) * area.width);
+    const padL = (i === 0) ? pad : pad / 2;
+    const padR = (i === ZONES.length - 1) ? pad : pad / 2;
+    return {
+        x: x0 + padL,
+        y: area.y + pad,
+        width: (x1 - x0) - padL - padR,
+        height: area.height - 2 * pad
+    };
+}
+
+function tilePadding(leaf, root) {
+    if (leaf && leaf.padding !== undefined) return leaf.padding;
+    if (root && root.padding !== undefined) return root.padding;
+    return GAP;
+}
+
+// Force GAP onto a tile and everything under it. Returns how many tiles moved.
+function resetPadding(tile) {
+    let changed = 0;
+    try {
+        if (tile.padding !== GAP) {
+            tile.padding = GAP;
+            changed++;
+        }
+    } catch (e) { dbg("padding.set.failed", e); }
+    const kids = tile.tiles || [];
+    for (let i = 0; i < kids.length; i++) changed += resetPadding(kids[i]);
+    return changed;
+}
+
+// If `tile` is one of the canonical columns, return its index, else -1.
+function canonicalIndexOf(tile) {
+    if (!tile) return -1;
+    const root = tile.parent;
+    if (!isCanonicalRoot(root)) return -1;
+    const kids = root.tiles;
+    for (let i = 0; i < kids.length; i++) {
+        if (kids[i] === tile) return i;
+    }
+    return -1;
+}
+
+// --- Ratio enforcement ------------------------------------------------------
+// Push ZONES back into KWin's own tile ratios so the drift never reaches
+// kwinrc. `applying` guards against the re-entrancy this causes: writing
+// relativeGeometry synchronously emits layoutModified / relativeGeometryChanged,
+// which are hooked below.
+let applying = false;
+
+// Fractional slop tolerated before rewriting a ratio. Only there to avoid
+// pointless writes, so keep it well under a pixel: 0.0001 is 0.4px on a 4096px
+// screen, and far above double-precision noise. (The previous 0.001 was ~4px,
+// loose enough to let a visibly off-center column sit there unfixed.)
+const RATIO_EPSILON = 0.0001;
+
+function resetLeafRatio(leaf, i) {
+    try {
+        const rel = { x: zoneOffset(i), y: 0, width: ZONES[i], height: 1 };
+        const cur = leaf.relativeGeometry;
+        if (cur
+            && Math.abs(cur.x - rel.x) <= RATIO_EPSILON
+            && Math.abs(cur.y - rel.y) <= RATIO_EPSILON
+            && Math.abs(cur.width - rel.width) <= RATIO_EPSILON
+            && Math.abs(cur.height - rel.height) <= RATIO_EPSILON) {
+            return false;
+        }
+
+        leaf.relativeGeometry = rel;
+        log("zone.reset", "col=" + i,
+            "was=" + (cur ? cur.x.toFixed(4) + "/" + cur.width.toFixed(4) : "?"),
+            "->", rel.x + "/" + rel.width);
+        return true;
+    } catch (e) {
+        log("zone.reset.failed", "col=" + i, e);
+        return false;
+    }
+}
+
+// Re-assert ZONES on every screen. Cheap and idempotent: when nothing has
+// drifted this is ZONES.length float comparisons per screen and no writes.
+function enforceZones(reason) {
+    if (applying) return;
+    applying = true;
+    try {
+        const screens = workspace.screens || [];
+        for (let s = 0; s < screens.length; s++) {
+            let root = null;
+            try {
+                const tm = workspace.tilingForScreen(screens[s]);
+                root = tm ? tm.rootTile : null;
+            } catch (e) {
+                log("enforce.threw", "screen=" + s, e);
+                continue;
+            }
+            if (!root) continue;
+
+            const name = screens[s].name || ("screen" + s);
+
+            // Padding first, and regardless of layout shape — a gap is a gap
+            // whether or not the columns are ours.
+            const padded = resetPadding(root);
+            if (padded > 0) {
+                log("gap.reset", reason, "screen=" + name,
+                    "padding -> " + GAP, "tiles=" + padded);
+            }
+
+            if (!isCanonicalRoot(root)) {
+                // Loud on purpose: silence here is what made the previous
+                // freeze-cache failure invisible for days.
+                log("enforce.skip", reason, "screen=" + name,
+                    "root is not a " + ZONES.length + "-column horizontal split",
+                    "(dir=" + root.layoutDirection +
+                    " kids=" + (root.tiles ? root.tiles.length : "?") + ")");
+                continue;
+            }
+
+            let changed = 0;
+            const kids = root.tiles;
+            for (let i = 0; i < kids.length; i++) {
+                if (resetLeafRatio(kids[i], i)) changed++;
+            }
+            if (changed > 0) {
+                log("enforce", reason, "screen=" + name,
+                    "area=" + rectStr(root.absoluteGeometry),
+                    "cols=" + ZONES.join("/"), "reset=" + changed);
+            } else {
+                dbg("enforce", reason, "screen=" + name, "already canonical");
+            }
+        }
+    } finally {
+        applying = false;
+    }
+}
+
+// --- Deferred enforcement ---------------------------------------------------
+// A panel move (Meta+Shift+G) does not land in one step: plasmashell restores
+// the panel thickness and KWin only republishes struts once that has happened,
+// so the work area — and therefore every zone rect — is still moving for about
+// a second afterwards. Straddle the settle with several passes, matching what
+// panel-edge-toggle does for windows.
+const SETTLE_DELAYS = [0, 450, 1000];
+
+// Timers must outlive the function that starts them or they are collected
+// before firing.
+let pendingTimers = [];
+
+function enforceSoon(reason) {
+    for (let i = 0; i < pendingTimers.length; i++) {
+        try { pendingTimers[i].stop(); } catch (e) { /* already fired */ }
+    }
+    pendingTimers = [];
+
+    for (let i = 0; i < SETTLE_DELAYS.length; i++) {
+        const delay = SETTLE_DELAYS[i];
+        if (delay === 0) {
+            enforceZones(reason);
+            continue;
+        }
+        const timer = new QTimer();
+        timer.singleShot = true;
+        timer.interval = delay;
+        timer.timeout.connect(function () {
+            enforceZones(reason + "+" + delay + "ms");
+        });
+        timer.start();
+        pendingTimers.push(timer);
+    }
+}
+
+// --- Tiling signal hookup ---------------------------------------------------
+// KWin rebuilds the custom-tile tree on output and work-area changes, handing
+// out fresh Tile objects each time, so never hold a reference to one: re-resolve
+// through tilingForScreen() on demand and re-hook whenever the root is replaced.
+const hookedRoots = new Set();
+const hookedManagers = new Set();
+
+function hookRoot(root, screenName) {
+    if (!root || hookedRoots.has(root)) return;
+    hookedRoots.add(root);
+
+    // Work area changed (panel moved / resized / resolution change): the zone
+    // rects move with it, and KWin may have rescaled the ratios to fit.
+    try {
+        root.absoluteGeometryChanged.connect(function () {
+            enforceSoon("area-change:" + screenName);
+        });
+    } catch (e) { dbg("hook absoluteGeometryChanged failed", screenName, e); }
+
+    // Someone edited the layout (Meta+T drag, or KWin resizing a tile).
+    try {
+        root.layoutModified.connect(function () {
+            enforceZones("layout-modified:" + screenName);
+        });
+    } catch (e) { dbg("hook layoutModified failed", screenName, e); }
+
+    // Tiles added/removed — shape change, may or may not still be canonical.
+    try {
+        root.childTilesChanged.connect(function () {
+            enforceSoon("child-tiles:" + screenName);
+        });
+    } catch (e) { dbg("hook childTilesChanged failed", screenName, e); }
+}
+
+function hookTiling(reason) {
     const screens = workspace.screens || [];
-    const before = frozenLayout.size;
-    for (let i = 0; i < screens.length; i++) {
-        try {
-            const tm = workspace.tilingForScreen(screens[i]);
-            if (tm && tm.rootTile) freezeTree(tm.rootTile);
-        } catch (e) { log("freezeCurrentVD threw on screen", i, e); }
+    for (let s = 0; s < screens.length; s++) {
+        const name = screens[s].name || ("screen" + s);
+        let tm = null;
+        try { tm = workspace.tilingForScreen(screens[s]); }
+        catch (e) { log("hookTiling threw", name, e); continue; }
+        if (!tm) continue;
+
+        if (!hookedManagers.has(tm)) {
+            hookedManagers.add(tm);
+            try {
+                tm.rootTileChanged.connect(function () {
+                    log("tiling.rootTileChanged", "screen=" + name);
+                    hookTiling("root-replaced:" + name);
+                    enforceSoon("root-replaced:" + name);
+                });
+            } catch (e) { dbg("hook rootTileChanged failed", name, e); }
+        }
+
+        hookRoot(tm.rootTile, name);
     }
-    log("freeze", reason, "leaves=" + frozenLayout.size, "added=" + (frozenLayout.size - before));
+    dbg("hookTiling", reason, "roots=" + hookedRoots.size);
 }
 
 // --- Pending coupled-resize state ------------------------------------------
@@ -233,15 +488,6 @@ function siblingAcrossEdge(tile, edge) {
 }
 
 // --- Debug helpers (only used when DEBUG=true) -----------------------------
-function probeTileIdentity(rootTile, label) {
-    if (!rootTile) { log("identity", label, "rootTile=null"); return; }
-    const a = rootTile.tiles && rootTile.tiles[0];
-    const b = rootTile.tiles && rootTile.tiles[0];
-    log("identity", label,
-        "rootTile.tiles[0] === rootTile.tiles[0]:", (a === b),
-        "len:", (rootTile.tiles ? rootTile.tiles.length : "n/a"));
-}
-
 function walkTile(tile, depth, indexPath) {
     const indent = "  ".repeat(depth);
     const kids = tile.tiles || [];
@@ -271,9 +517,7 @@ function dumpAllTiles(reason) {
         try { tm = workspace.tilingForScreen(o); }
         catch (e) { log("tilingForScreen threw:", e); continue; }
         if (!tm) { log("tilingForScreen returned null"); continue; }
-        const rt = tm.rootTile;
-        probeTileIdentity(rt, "screen=" + o.name);
-        if (rt) walkTile(rt, 1, "0");
+        if (tm.rootTile) walkTile(tm.rootTile, 1, "0");
     }
     log("==== end dump ====");
 }
@@ -350,7 +594,8 @@ function hookWindow(w) {
                     }
                     log("tiled.sibling", "id=" + id,
                         "sibFrozen=" + rectStr(siblingFrozen),
-                        "sibTop=" + safeId(sibWindow));
+                        "sibTop=" + safeId(sibWindow),
+                        sibWindow ? "" : "(sibling zone is empty — nothing to couple to)");
                 } else {
                     log("tiled.sibling", "id=" + id, "edge=" + edge, "none (screen edge)");
                 }
@@ -419,34 +664,28 @@ function hookWindow(w) {
         w.tileChanged.connect(function () {
             log("win.tileChanged", snapshot("tileChanged"),
                 "tile.abs=" + (w.tile ? rectStr(w.tile.absoluteGeometry) : "null"));
-            if (w.tile) {
-                // Re-tile invalidates any sticky pair.
-                if (pairing.has(w)) dropPair(w, "re-tiled");
-                // Assert the frozen rect, but only along the axis the split owns.
-                // tile.absoluteGeometry includes panel-blocked space; KWin places the
-                // window at the panel-adjusted size. Enforcing the full frozen rect
-                // would push the window over the panel. For a horizontal-split parent,
-                // pin only x/width; for vertical, only y/height. The other axis stays
-                // at KWin's panel-aware live value.
-                const frozen = frozenLayout.get(w.tile);
-                if (frozen) {
-                    const live = w.frameGeometry;
-                    const target = { x: live.x, y: live.y, width: live.width, height: live.height };
-                    const p = w.tile.parent;
-                    if (p && p.layoutDirection === 1) {
-                        target.x = frozen.x;
-                        target.width = frozen.width;
-                    } else if (p && p.layoutDirection === 2) {
-                        target.y = frozen.y;
-                        target.height = frozen.height;
-                    }
-                    if (!rectApproxEqual(live, target)) {
-                        log("freeze.assert", "id=" + id,
-                            "live=" + rectStr(live),
-                            "target=" + rectStr(target));
-                        w.frameGeometry = target;
-                    }
-                }
+            if (!w.tile) return;
+
+            // Re-tile invalidates any sticky pair.
+            if (pairing.has(w)) dropPair(w, "re-tiled");
+
+            // Assert the canonical zone, recomputed live — but only along the
+            // split axis. tile.absoluteGeometry is the work area, and KWin
+            // places the window with its own padding convention; pinning the
+            // full rect would fight it on y/height. For our horizontal split
+            // that means x/width only, leaving y/height at KWin's live value.
+            const i = canonicalIndexOf(w.tile);
+            if (i < 0) return;
+
+            const root = w.tile.parent;
+            const zone = canonicalRect(root.absoluteGeometry, i, tilePadding(w.tile, root));
+            const live = w.frameGeometry;
+            const target = { x: zone.x, y: live.y, width: zone.width, height: live.height };
+            if (!rectApproxEqual(live, target)) {
+                log("zone.assert", "id=" + id, "col=" + i,
+                    "live=" + rectStr(live),
+                    "target=" + rectStr(target));
+                w.frameGeometry = target;
             }
         });
     } catch (e) { log("hook tileChanged failed for", id, e); }
@@ -461,8 +700,10 @@ function hookWindow(w) {
 
 // --- Bootstrapping ----------------------------------------------------------
 function bootstrap() {
-    log("loaded.");
-    freezeCurrentVD("bootstrap");
+    log("loaded.", "zones=" + ZONES.join("/"));
+
+    hookTiling("bootstrap");
+    enforceZones("bootstrap");
 
     try {
         const list = workspace.windowList ? workspace.windowList() : (workspace.clientList ? workspace.clientList() : []);
@@ -486,18 +727,39 @@ function bootstrap() {
     try {
         workspace.currentDesktopChanged.connect(function () {
             log("workspace.currentDesktopChanged ->", workspace.currentDesktop ? workspace.currentDesktop.name : "?");
-            freezeCurrentVD("VD-change");
+            // KWin keeps a separate tile tree per (output, desktop) pair, so the
+            // root we were hooked to is not the one now in effect.
+            hookTiling("VD-change");
+            enforceZones("VD-change");
             if (DEBUG) dumpAllTiles("currentDesktopChanged");
         });
     } catch (e) { log("hook currentDesktopChanged failed:", e); }
 
-    registerShortcut("FancySnapRefreeze", "fancy_snap: re-freeze current tile layout as zones",
+    // Output added/removed/enabled/disabled — new tile managers and roots.
+    try {
+        workspace.screensChanged.connect(function () {
+            log("workspace.screensChanged", "screens=" + (workspace.screens ? workspace.screens.length : "?"));
+            hookTiling("screens-change");
+            enforceSoon("screens-change");
+        });
+    } catch (e) { log("hook screensChanged failed:", e); }
+
+    // Resolution / arrangement change. Panel moves surface through the root
+    // tile's absoluteGeometryChanged instead, hooked in hookRoot().
+    try {
+        workspace.virtualScreenGeometryChanged.connect(function () {
+            log("workspace.virtualScreenGeometryChanged",
+                "geom=" + rectStr(workspace.virtualScreenGeometry));
+            hookTiling("vscreen-change");
+            enforceSoon("vscreen-change");
+        });
+    } catch (e) { log("hook virtualScreenGeometryChanged failed:", e); }
+
+    registerShortcut("FancySnapRefreeze", "fancy_snap: re-assert canonical zones",
                      "Meta+Shift+T", function () {
-        const before = frozenLayout.size;
-        frozenLayout.clear();
-        freezeCurrentVD("refreeze-hotkey");
-        log("refreeze.done", "cleared=" + before, "now=" + frozenLayout.size);
-        if (DEBUG) dumpAllTiles("refreeze-hotkey");
+        hookTiling("hotkey");
+        enforceSoon("hotkey");
+        if (DEBUG) dumpAllTiles("hotkey");
     });
 
     if (DEBUG) dumpAllTiles("bootstrap");
