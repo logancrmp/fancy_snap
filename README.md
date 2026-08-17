@@ -2,17 +2,11 @@
 
 A small KWin script that turns KDE Plasma 6's built-in custom tiles (`Meta+T`) into a FancyZones-style fixed-zone window snapper: the zones you define never drift, mouse-resizing a tiled window detaches it instead of mutating the zone, and the boundary between two tiled windows can be re-dragged iteratively without ever editing the saved layout.
 
-## What problem this solves
+## What Is It?
 
-KDE Plasma 6 ships custom tiles plus `Shift`+drag to snap, which is almost what you want. The problem: edge-resizing a tiled window updates `Tile.relativeGeometry` in place and persists it to `~/.config/kwinrc` on a 2-second debounce. Over a session of normal use, your zones drift away from their intended ratios. There is no built-in "lock tiles" toggle as of 6.6.
+fancy_snap is a small KWin script for KDE Plasma 6 that turns the built-in custom tiles (the ones you set up with Meta+T) into fixed, FancyZones-style snap zones. You define your column layout once as fractions in a single line of the script — `const ZONES = [0.25, 0.5, 0.25]` — and those zones stay exactly where you put them: normally KDE lets you drag a tile boundary and quietly rewrites the saved layout, so your zones creep off-center over a session.
 
-This script intercepts every tile-related event and ensures:
-
-- Window placement always uses the zone rect **recomputed from `ZONES` against the live work area**, not whatever drifted state KWin has accumulated. Nothing is cached, so a panel move, resolution change or output swap is picked up automatically.
-- KWin's own tile ratios are reset to `ZONES` the moment they drift, so the drift never reaches `kwinrc` either.
-- Edge-resizing a tiled window detiles it (zone untouched) rather than mutating the zone boundary.
-- Coupled-edge resize across two tiles re-flows both windows symmetrically while leaving the zones alone.
-- Once two windows are paired via a coupled untile, the script remembers them and lets you keep dragging their shared edge iteratively without re-tiling.
+Instead, edge-resizing a tiled window pops it out of its zone and resizes it freely, leaving the zone untouched; if there's a window in the neighbouring zone, both are released together so their shared edge moves as one, and you can keep dragging that edge afterwards. Windows sit flush — edge to edge and top to taskbar, no gaps — and the zones re-assert themselves automatically when anything changes underneath them, like switching virtual desktops, moving your panel, or plugging in a monitor.
 
 ## Configuring your zones
 
